@@ -1,0 +1,15 @@
+cd ~/nercel-11.0
+# 1) health
+curl -s localhost:5062/api/health; echo
+# 2) une route inexistante doit renvoyer du JSON (fini le bug JSON.parse)
+curl -s -i localhost:5062/api/nexistepas | head -3
+# 3) le chat qui AGIT : cree + lance un vrai agent
+curl -s -X POST localhost:5062/api/chat -H 'Content-Type: application/json' -d '{"message":"cree un agent qui surveille le reseau"}'; echo
+# 4) LES LOGS - tu dois voir des lignes en direct
+curl -s "localhost:5062/api/logs?after=0" | head -c 1200; echo
+# 5) scaffold reel
+curl -s -X POST localhost:5062/api/scaffolds/create -H 'Content-Type: application/json' -d '{"name":"demo14","blueprint":"py-cli"}'; echo
+# 6) recommandations
+curl -s -X POST localhost:5062/api/agents/recommend -H 'Content-Type: application/json' -d '{"goal":"agent qui code du python"}'; echo
+# 7) LE ZIP - il se fabrique sur TA machine, ici:
+cd ~/nercel-11.0 && rm -f nercel14-hub.zip && (zip -9 nercel14-hub.zip nercel14.py start14.sh 2>/dev/null || python3 -m zipfile -c nercel14-hub.zip nercel14.py start14.sh) && ls -lh nercel14-hub.zip
