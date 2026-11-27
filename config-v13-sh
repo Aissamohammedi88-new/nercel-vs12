@@ -1,0 +1,1074 @@
+cd ~/nercel-11.0
+cat > nercel14.py << 'PYEOF'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ============================================================
+#  NERCEL 14 "HUB" - theme Grafana v10 restaure
+#  - Logs LIVE : chaque agent ecrit dans la console en temps reel
+#  - Chat reel : parle (Ollama si present) ET agit (cree/lance agents)
+#  - Tout dans UNE page : Dash / Agents / Chat / Logs / Scaffolds / Catalogue
+#  stdlib only - python3 nercel14.py - http://localhost:5062
+# ============================================================
+import json, os, re, shutil, subprocess, threading, time, uuid
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib import request as urlreq
+from urllib.parse import urlparse, parse_qs
+
+VERSION = "14.0"
+PORT = 5062
+HOME = os.path.dirname(os.path.abspath(__file__))
+SCAFFOLD_ROOT = os.path.join(HOME, "scaffolds14")
+OLLAMA = "http://127.0.0.1:11434"
+START_TS = time.time()
+
+LOCK = threading.RLock()
+AGENTS = {}
+RUNS = deque(maxlen=200)
+LOG_SEQ = 0
+LOG_FEED = deque(maxlen=4000)
+CHAT = deque(maxlen=300)
+SERIES = {"cpu": deque(maxlen=300), "ram": deque(maxlen=300),
+          "net": deque(maxlen=300), "disk": deque(maxlen=300),
+          "load": deque(maxlen=300)}
+NET_PREV = None
+
+FORBIDDEN = ("sudo ", "rm -rf /", "mkfs", "dd if=", ":(){", "shutdown",
+             "reboot", "> /dev/sd", "chmod -r 777 /", "chmod -R 777 /")
+
+def log(agent, level, text):
+    global LOG_SEQ
+    with LOCK:
+        LOG_SEQ += 1
+        LOG_FEED.append({"seq": LOG_SEQ, "ts": time.time(), "agent": agent,
+                         "level": level, "text": str(text)[:500]})
+
+def slugify(s):
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", (s or "").lower()).strip("-")
+    return s or "agent"
+
+def cmd_is_safe(cmd):
+    low = " ".join((cmd or "").lower().split())
+    return not any(f in low for f in FORBIDDEN)
+
+PROMPT_RULES = [
+    (("cpu", "processeur", "charge systeme", "top"), 'bash -lc "top -bn1 | head -18"'),
+    (("ram", "memoire", "memory"), 'bash -lc "free -h"'),
+    (("disque", "disk", "stockage", "espace"), 'bash -lc "df -h; du -sh . 2>/dev/null"'),
+    (("reseau", "net", "port"), 'bash -lc "ss -tuln | head -25"'),
+    (("process", "processus", "pid"), 'bash -lc "ps aux --sort=-%cpu | head -15"'),
+    (("fichier", "gros", "nettoyage"), 'bash -lc "du -ah . 2>/dev/null | sort -rh | head -15"'),
+    (("git", "commit", "repo"), 'bash -lc "git status 2>&1 | head -6; git log --oneline -5 2>&1 | head -6"'),
+    (("backup", "sauvegarde"), 'bash -lc "tar -czf backup_$(date +%Y%m%d_%H%M%S).tar.gz --exclude=backup_* --exclude=scaffolds* . 2>/dev/null; ls -lh backup_* 2>/dev/null | tail -2"'),
+    (("date", "heure", "uptime"), 'bash -lc "date; uptime"'),
+    (("ping", "internet", "connexion"), 'ping -c 3 -W 2 1.1.1.1 2>&1 | tail -4'),
+    (("test", "verifie", "check"), 'bash -lc "python3 -m py_compile *.py 2>&1 | head -10 && echo compile OK"'),
+]
+
+def compile_prompt(text):
+    t = (text or "").lower()
+    for keys, cmd in PROMPT_RULES:
+        if any(k in t for k in keys):
+            return cmd
+    safe = re.sub(r"[^A-Za-z0-9 ]", "", (text or "veille"))[:60]
+    return 'bash -lc "echo [tache] %s; date; uptime"' % safe
+
+def ollama_models():
+    try:
+        r = urlreq.urlopen(OLLAMA + "/api/tags", timeout=2)
+        j = json.loads(r.read().decode("utf-8"))
+        return [m.get("name", "") for m in j.get("models", []) if m.get("name")]
+    except Exception:
+        return []
+
+OLLAMA_STATE = {"up": False, "model": None, "checked": 0.0}
+
+def ollama_state(force=False):
+    now = time.time()
+    if not force and now - OLLAMA_STATE["checked"] < 30:
+        return OLLAMA_STATE["up"], OLLAMA_STATE["model"]
+    models = ollama_models()
+    OLLAMA_STATE.update(up=bool(models), model=models[0] if models else None, checked=now)
+    return OLLAMA_STATE["up"], OLLAMA_STATE["model"]
+
+def ollama_commands(prompt, goal):
+    try:
+        models = ollama_models()
+        if not models:
+            return None
+        q = ('Tu generes UNE commande bash Linux, courte et sure, qui realise: "%s". '
+             'Reponds UNIQUEMENT par la commande, sans explication, sans backticks.'
+             % (prompt or goal or "etat systeme"))[:600]
+        data = json.dumps({"model": models[0], "prompt": q, "stream": False}).encode("utf-8")
+        req = urlreq.Request(OLLAMA + "/api/generate", data=data,
+                             headers={"Content-Type": "application/json"})
+        r = urlreq.urlopen(req, timeout=90)
+        cmd = json.loads(r.read().decode("utf-8")).get("response", "").strip()
+        cmd = cmd.strip("`").strip()
+        if not cmd or "\n" in cmd or not cmd_is_safe(cmd):
+            return None
+        return {"run": cmd, "source": "ollama:" + models[0]}
+    except Exception:
+        return None
+
+def metrics_snapshot():
+    with LOCK:
+        last = {k: list(v)[-1] if v else (0, 0) for k, v in SERIES.items()}
+    return {"cpu": last["cpu"][1], "ram": last["ram"][1], "net": last["net"][1],
+            "disk": last["disk"][1], "load": last["load"][1]}
+
+def agent_create(p):
+    name = (p.get("name") or "").strip() or "agent-sans-nom"
+    goal = (p.get("goal") or "").strip()
+    if not goal:
+        return None, "objectif (goal) requis"
+    slug = slugify(name)
+    with LOCK:
+        if any(a["slug"] == slug for a in AGENTS.values()):
+            slug = slug + "-" + uuid.uuid4().hex[:4]
+        aid = uuid.uuid4().hex[:8]
+        built = ollama_commands(p.get("prompt"), goal) if p.get("use_ollama") else None
+        if built is None:
+            built = {"run": compile_prompt(p.get("prompt") or goal), "source": "prompt-rules"}
+        if not cmd_is_safe(built["run"]):
+            return None, "commande refusee (mot interdit)"
+        a = {"id": aid, "slug": slug, "name": name, "goal": goal,
+             "cmd": built["run"], "source": built["source"],
+             "interval": max(0, int(p.get("interval") or 0)),
+             "created": time.time(), "runs": 0, "last_status": "jamais",
+             "last_exit": None, "last_ts": None, "status": "idle"}
+        AGENTS[aid] = a
+    log("hub", "ok", "agent cree: %s (%s) cmd=%s" % (name, aid, built["run"][:80]))
+    return a, None
+
+def run_agent(aid):
+    with LOCK:
+        a = AGENTS.get(aid)
+    if not a:
+        return None, "agent inconnu"
+    run = {"id": uuid.uuid4().hex[:8], "agent_id": aid, "agent": a["slug"],
+           "ts": time.time(), "status": "running", "exit": None, "pid": None}
+    with LOCK:
+        RUNS.appendleft(run)
+        a["status"] = "running"
+        a["runs"] += 1
+    threading.Thread(target=_worker, args=(dict(a), run), daemon=True).start()
+    return run, None
+
+def _worker(a, run):
+    n = 0
+    code = -1
+    proc = None
+    log(a["slug"], "sys", "$ " + a["cmd"])
+    try:
+        proc = subprocess.Popen(a["cmd"], shell=True, cwd=HOME,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        run["pid"] = proc.pid
+        log(a["slug"], "info", "pid %d demarre - la sortie arrive en direct" % proc.pid)
+        t0 = time.time()
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(a["slug"], "out", line)
+                n += 1
+            if time.time() - t0 > 170:
+                proc.kill()
+                log(a["slug"], "warn", "cap 170s - processus tue")
+                break
+        code = proc.wait(timeout=15)
+    except Exception as e:
+        code = -1
+        log(a["slug"], "err", "erreur worker: %s" % e)
+        try:
+            if proc:
+                proc.kill()
+        except Exception:
+            pass
+    run["exit"] = code
+    run["status"] = "ok" if code == 0 else "error"
+    with LOCK:
+        cur = AGENTS.get(a["id"])
+        if cur:
+            cur["status"] = "idle"
+            cur["last_status"] = run["status"]
+            cur["last_exit"] = code
+            cur["last_ts"] = time.time()
+    log(a["slug"], "ok" if code == 0 else "err",
+        "run %s fini - exit=%s, %d lignes de log" % (run["id"], code, n))
+
+BP_FILES = {}
+BP_FILES["py-cli"] = {
+    "cli.py": ("#!/usr/bin/env python3\nimport sys\n\n"
+               "def main():\n"
+               "    args = [a for a in sys.argv[1:] if not a.startswith('--')]\n"
+               "    name = args[0] if args else 'ForgeHub'\n"
+               "    msg = ' '.join(args[1:]) or 'Bonjour depuis %s' % name\n"
+               "    if '--shout' in sys.argv:\n        msg = msg.upper() + '!'\n"
+               "    print(msg)\n\n"
+               "if __name__ == '__main__':\n    main()\n")}
+BP_FILES["py-lib"] = {
+    "forge_lib.py": "def shout(t):\n    return str(t).upper() + '!'\n\ndef add(*n):\n    return sum(n)\n",
+    "test_lib.py": "from forge_lib import shout, add\nprint(shout('forge'))\nprint('add(2,3) =', add(2, 3))\n"}
+BP_FILES["http-service"] = {
+    "service.py": ("#!/usr/bin/env python3\nimport json\n"
+                   "from http.server import BaseHTTPRequestHandler, HTTPServer\n\n"
+                   "class H(BaseHTTPRequestHandler):\n"
+                   "    def do_GET(self):\n"
+                   "        body = json.dumps({'service': 'forge-service', 'ok': True}).encode()\n"
+                   "        self.send_response(200)\n"
+                   "        self.send_header('Content-Type', 'application/json')\n"
+                   "        self.send_header('Content-Length', str(len(body)))\n"
+                   "        self.end_headers()\n"
+                   "        self.wfile.write(body)\n"
+                   "    def log_message(self, *a):\n        pass\n\n"
+                   "print('service sur :8077')\n"
+                   "HTTPServer(('0.0.0.0', 8077), H).serve_forever()\n")}
+BP_FILES["flask-api"] = {
+    "app.py": ("from flask import Flask, jsonify\napp = Flask(__name__)\n\n"
+               "@app.route('/')\ndef root():\n    return jsonify(ok=True, service='forge-flask')\n\n"
+               "if __name__ == '__main__':\n    app.run(port=8078)\n"),
+    "requirements.txt": "flask\n"}
+BP_FILES["fastapi-api"] = {
+    "main.py": ("from fastapi import FastAPI\napp = FastAPI(title='ForgeAPI')\n\n"
+                "@app.get('/')\ndef root():\n    return {'ok': True, 'service': 'forge-fastapi'}\n"),
+    "requirements.txt": "fastapi\nuvicorn\n"}
+BP_FILES["static-site"] = {
+    "index.html": ("<!doctype html>\n<html lang=fr><head><meta charset=utf-8>\n"
+                   "<title>Forge Site</title>\n<link rel=stylesheet href=style.css>\n"
+                   "</head><body>\n<h1>ForgeHub Site</h1>\n<p>Genere par Nercel Hub v14.</p>\n</body></html>\n"),
+    "style.css": ("body{background:#111217;color:#ccccdc;font-family:system-ui;"
+                  "display:grid;place-items:center;min-height:100vh;margin:0}\n"
+                  "h1{color:#ff8f3a}\n")}
+BP_FILES["agent-bot"] = {
+    "bot.py": ("#!/usr/bin/env python3\nimport time\n\n"
+               "def cpu():\n"
+               "    with open('/proc/stat') as f:\n"
+               "        p = [int(x) for x in f.readline().split()[1:9]]\n"
+               "    return p\n\n"
+               "prev = cpu()\n"
+               "for i in range(6):\n"
+               "    time.sleep(2)\n"
+               "    cur = cpu()\n"
+               "    idle = (cur[3] + cur[4]) - (prev[3] + prev[4])\n"
+               "    tot = sum(cur) - sum(prev)\n"
+               "    print('cpu %.1f%%' % (100.0 * (1 - idle / tot) if tot else 0.0))\n"
+               "    prev = cur\n")}
+BP_FILES["data-pipeline"] = {
+    "pipeline.py": ("#!/usr/bin/env python3\nimport json\n\n"
+                    "rows = [{'host': 'forge-%d' % i, 'cpu': (i * 13) % 100} for i in range(10)]\n"
+                    "with open('data.json', 'w') as f:\n"
+                    "    json.dump(rows, f, indent=2)\n"
+                    "avg = sum(r['cpu'] for r in rows) / len(rows)\n"
+                    "print('pipeline ok - %d lignes, cpu moyen %.1f' % (len(rows), avg))\n")}
+
+BLUEPRINTS = {
+    "py-cli":        {"label": "CLI Python",         "desc": "outil ligne de commande (salue / crie)",          "cmd": "python3 cli.py ForgeHub --shout", "files": BP_FILES["py-cli"]},
+    "py-lib":        {"label": "Librairie Python",   "desc": "module + mini test",                              "cmd": "python3 test_lib.py", "files": BP_FILES["py-lib"]},
+    "http-service":  {"label": "Service HTTP stdlib","desc": "serveur JSON sans dependance, port 8077",         "cmd": "python3 service.py", "files": BP_FILES["http-service"]},
+    "flask-api":     {"label": "API Flask",          "desc": "API web Flask, port 8078",                        "cmd": "python3 app.py", "files": BP_FILES["flask-api"]},
+    "fastapi-api":   {"label": "API FastAPI",        "desc": "API moderne + uvicorn",                           "cmd": "uvicorn main:app --port 8079", "files": BP_FILES["fastapi-api"]},
+    "static-site":   {"label": "Site statique",      "desc": "index.html + css theme forge",                    "cmd": "xdg-open index.html", "files": BP_FILES["static-site"]},
+    "agent-bot":     {"label": "Bot agent CPU",      "desc": "vrai agent qui lit /proc et rapporte le cpu",     "cmd": "python3 bot.py", "files": BP_FILES["agent-bot"]},
+    "data-pipeline": {"label": "Pipeline donnees",   "desc": "genere data.json + stats",                        "cmd": "python3 pipeline.py", "files": BP_FILES["data-pipeline"]},
+}
+
+def scaffold_create(p):
+    name = (p.get("name") or "").strip()
+    bp = p.get("blueprint") or "py-cli"
+    if bp not in BLUEPRINTS:
+        return None, "blueprint inconnu: %s" % bp
+    slug = slugify(name) if name else bp + "-" + uuid.uuid4().hex[:4]
+    target = os.path.join(SCAFFOLD_ROOT, slug)
+    if os.path.exists(target):
+        return None, "le dossier existe deja: " + target
+    b = BLUEPRINTS[bp]
+    os.makedirs(target)
+    made = []
+    for fname, content in b["files"].items():
+        fp = os.path.join(target, fname)
+        d = os.path.dirname(fp)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with open(fp, "w") as f:
+            f.write(content)
+        if fname.endswith(".py"):
+            os.chmod(fp, 0o755)
+        made.append(os.path.relpath(fp, HOME))
+        log("scaffold", "info", "ecrit " + os.path.relpath(fp, HOME))
+    log("scaffold", "ok", "scaffold %s cree (%d fichiers) - %s" % (slug, len(made), target))
+    return {"slug": slug, "path": target, "files": made, "blueprint": bp, "run": b["cmd"]}, None
+
+STOP = {"le", "la", "les", "un", "une", "des", "de", "du", "et", "qui", "que", "pour",
+        "avec", "dans", "sur", "je", "mon", "ma", "mes", "the", "of", "to", "and",
+        "my", "for", "with", "in", "on", "il", "elle", "ce", "ca", "au", "aux", "en",
+        "par", "est", "sont", "fait", "faire", "peux", "peut", "veux", "veut"}
+
+OSS_CATALOG = [
+    {"name": "Aider", "url": "https://github.com/Aider-AI/aider", "desc": "assistant de code en terminal, edite ton repo git", "tags": ["code", "python", "git", "cli", "editeur"], "install": "pip install aider-chat"},
+    {"name": "OpenHands", "url": "https://github.com/All-Hands-AI/OpenHands", "desc": "agent dev autonome complet (ex OpenDevin)", "tags": ["agent", "dev", "autonome", "code"], "install": "docker run -p 3000:3000 ghcr.io/all-hands-ai/openhands:latest"},
+    {"name": "Open Interpreter", "url": "https://github.com/openinterpreter/open-interpreter", "desc": "execute du code en langage naturel sur ta machine", "tags": ["code", "terminal", "local"], "install": "pip install open-interpreter"},
+    {"name": "CrewAI", "url": "https://github.com/crewAIInc/crewAI", "desc": "equipes d'agents IA multi-roles", "tags": ["agents", "multi", "workflow", "equipe"], "install": "pip install crewai"},
+    {"name": "AutoGen", "url": "https://github.com/microsoft/autogen", "desc": "framework multi-agents de Microsoft", "tags": ["agents", "multi", "workflow", "microsoft"], "install": "pip install autogen-agentchat autogen-core"},
+    {"name": "LangGraph", "url": "https://github.com/langchain-ai/langgraph", "desc": "graphes d'agents deterministes", "tags": ["agents", "workflow", "graph", "langchain"], "install": "pip install langgraph"},
+    {"name": "gpt-engineer", "url": "https://github.com/AntonOsika/gpt-engineer", "desc": "genere un projet entier depuis un prompt", "tags": ["code", "generer", "projet", "scaffold"], "install": "pip install gpt-engineer"},
+    {"name": "SWE-agent", "url": "https://github.com/SWE-agent/SWE-agent", "desc": "agent qui repare des bugs tout seul", "tags": ["code", "bug", "fix", "autonome"], "install": "pip install sweagent"},
+    {"name": "Continue", "url": "https://github.com/continuedev/continue", "desc": "copilote IA open source dans VS Code", "tags": ["code", "ide", "vscode", "editeur"], "install": "code --install-extension continue.continue"},
+    {"name": "Devika", "url": "https://github.com/stitionai/devika", "desc": "ingeniere logicielle autonome", "tags": ["agent", "dev", "autonome", "plan"], "install": "git clone https://github.com/stitionai/devika && pip install -r requirements.txt"},
+    {"name": "Flowise", "url": "https://github.com/FlowiseAI/Flowise", "desc": "workflows d'agents en drag & drop", "tags": ["workflow", "ui", "drag", "agents"], "install": "npx flowise start"},
+    {"name": "Dify", "url": "https://github.com/langgenius/dify", "desc": "plateforme complete d'app IA + agents", "tags": ["plateforme", "agents", "apps", "workflow"], "install": "git clone https://github.com/langgenius/dify && cd dify/docker && docker compose up -d"},
+]
+
+def recommend(goal):
+    words = [w for w in re.split(r"[^a-zA-Z0-9]+", (goal or "").lower())
+             if len(w) > 2 and w not in STOP]
+    scored = []
+    for c in OSS_CATALOG:
+        score = 0
+        hits = []
+        tags = [t.lower() for t in c["tags"]]
+        for w in words:
+            if w in tags:
+                score += 4
+                hits.append(w)
+            elif w in c["desc"].lower() or w in c["name"].lower():
+                score += 1
+                hits.append(w)
+        if score:
+            scored.append((score, c, hits))
+    scored.sort(key=lambda x: -x[0])
+    return [{"name": c["name"], "url": c["url"], "desc": c["desc"],
+             "install": c["install"], "score": s, "matched": h} for s, c, h in scored[:4]]
+
+def engine_reply(message, agent):
+    t = (message or "").lower()
+    ms = metrics_snapshot()
+    if any(k in t for k in ("statu", "sante", "health", "etat", "ca va", "machine")):
+        return (f"Etat reel du hub - CPU {ms['cpu']:.0f}% / RAM {ms['ram']:.0f}% / "
+                f"disque {ms['disk']:.0f}% / charge {ms['load']:.2f} / reseau {ms['net']:.0f} B/s / "
+                f"{len(AGENTS)} agents. Tout est lu en direct dans /proc, rien de simule.")
+    if any(k in t for k in ("cree", "créé", "crée", "create", "nouvel", "nouveau")) and "agent" in t:
+        goal = t.split("agent", 1)[1].strip(" :?!.") or "veille automatique"
+        a, err = agent_create({"name": goal[:28], "goal": goal, "prompt": goal})
+        if err:
+            return "Impossible de creer: " + err
+        run_agent(a["id"])
+        return (f"Agent cree ET lance: {a['name']} (id {a['id']}).\nCommande: {a['cmd']}\n"
+                "Ouvre l'onglet Logs - il ecrit en direct.")
+    if any(k in t for k in ("lance", "run ", "execute", "exécute", "demarre", "démarre", "go ")):
+        for a in list(AGENTS.values()):
+            if a["slug"] in t or a["name"].lower() in t:
+                run_agent(a["id"])
+                return f"Je lance {a['slug']} maintenant - onglet Logs, la sortie arrive ligne par ligne."
+        return "Agent introuvable. Dis 'liste' pour voir tes agents."
+    if "log" in t:
+        with LOCK:
+            lines = list(LOG_FEED)[-5:]
+        if not lines:
+            return "Aucun log pour l'instant."
+        return "5 dernieres lignes du hub:\n" + "\n".join(
+            f"[{l['level']}] {l['agent']}: {l['text']}" for l in lines)
+    if any(k in t for k in ("liste", "list ", "mes agents", "quels")):
+        if not AGENTS:
+            return "Aucun agent. Dis 'cree un agent qui surveille le disque' et je le fais."
+        return "Tes agents:\n" + "\n".join(
+            f"- {a['name']} ({a['slug']}) - {a['goal'][:60]} [{a['last_status']}, runs={a['runs']}]"
+            for a in AGENTS.values())
+    if any(k in t for k in ("scaffold", "projet", "template", "blueprint")):
+        return ("Les projets reels: onglet Scaffolds - 8 blueprints qui ecrivent de vrais fichiers "
+                "sur disque (py-cli, fastapi-api, agent-bot...). Ici je cree plutot des AGENTS: "
+                "'cree un agent qui ...'.")
+    if any(k in t for k in ("bonjour", "salut", "hello", "hey", "cc")):
+        return ("Salut chef. Hub Nercel 14 - je parle ET j'agis: 'etat' (metriques reelles), "
+                "'liste', 'cree un agent qui surveille le CPU', 'lance <nom>', 'logs'.")
+    if any(k in t for k in ("aide", "help", "peux", "sais")):
+        return ("Commandes: 'etat' / 'liste' / 'logs' / 'cree un agent qui ...' / 'lance <nom>'. "
+                "Si Ollama tourne en local je discute librement (badge en haut a droite).")
+    if agent:
+        run_agent(agent["id"])
+        return (f"Message libre - j'ai relance {agent['slug']} et je regarde ses logs. "
+                "Sinon: etat / liste / cree un agent / lance <nom>.")
+    return "Essaie: 'etat', 'liste', 'logs', ou 'cree un agent qui surveille le disque'."
+
+def chat_post(p):
+    msg = (p.get("message") or "").strip()
+    if not msg:
+        return None, "message vide"
+    with LOCK:
+        agent = AGENTS.get(p.get("agent_id") or "")
+    a_slug = agent["slug"] if agent else "hub"
+    with LOCK:
+        CHAT.append({"role": "user", "agent": a_slug, "text": msg, "ts": time.time()})
+    log("chat", "info", "user: " + msg[:120])
+    reply = None
+    engine_used = "forge-engine"
+    models = ollama_models()
+    if models:
+        ms = metrics_snapshot()
+        sys_p = (f"Tu es {agent['name'] if agent else 'hub'}, agent du hub Nercel ForgeHub. "
+                 f"Reponds en francais, court et concret. Objectif: "
+                 f"{agent['goal'] if agent else 'assistant plateforme'}. "
+                 f"Etat reel machine: CPU {ms['cpu']:.0f}%, RAM {ms['ram']:.0f}%, disque {ms['disk']:.0f}%.")
+        try:
+            data = json.dumps({"model": models[0], "prompt": msg,
+                               "system": sys_p, "stream": False}).encode("utf-8")
+            req = urlreq.Request(OLLAMA + "/api/generate", data=data,
+                                 headers={"Content-Type": "application/json"})
+            r = urlreq.urlopen(req, timeout=90)
+            reply = json.loads(r.read().decode("utf-8")).get("response", "").strip() or None
+            if reply:
+                engine_used = "ollama:" + models[0]
+                log("chat", "ok", "ollama(%s) a repondu (%d car)" % (models[0], len(reply)))
+        except Exception as e:
+            log("chat", "warn", "ollama KO: %s - bascule moteur interne" % e)
+            reply = None
+    if not reply:
+        reply = engine_reply(msg, agent)
+    with LOCK:
+        CHAT.append({"role": "agent", "agent": a_slug, "text": reply, "ts": time.time()})
+    log("chat", "chat", "hub: " + reply[:120].replace("\n", " | "))
+    return {"reply": reply, "engine": engine_used}, None
+
+def cpu_jiffies():
+    with open("/proc/stat") as f:
+        p = f.readline().split()[1:]
+    return list(map(int, p[:8]))
+
+def sampler():
+    global NET_PREV
+    prev = cpu_jiffies()
+    with open("/proc/net/dev") as f:
+        NET_PREV = sum(int(l.split()[1]) for l in f.readlines()[2:]
+                       if not l.split()[0].rstrip(":").startswith("lo"))
+    time.sleep(5)
+    while True:
+        try:
+            cur = cpu_jiffies()
+            idle = (cur[3] + cur[4]) - (prev[3] + prev[4])
+            tot = sum(cur) - sum(prev)
+            cpu = 100.0 * (1 - idle / tot) if tot else 0.0
+            prev = cur
+            mem = {}
+            with open("/proc/meminfo") as f:
+                for l in f:
+                    k = l.split(":")
+                    if k[0] in ("MemTotal", "MemAvailable"):
+                        mem[k[0]] = int(k[1].split()[0])
+            ram = 100.0 * (1 - mem.get("MemAvailable", 0) / max(1, mem.get("MemTotal", 1)))
+            with open("/proc/net/dev") as f:
+                net_now = sum(int(l.split()[1]) for l in f.readlines()[2:]
+                              if not l.split()[0].rstrip(":").startswith("lo"))
+            rate = max(0, net_now - (NET_PREV or net_now)) / 5.0
+            NET_PREV = net_now
+            du = shutil.disk_usage(HOME)
+            load = os.getloadavg()[0]
+            ts = time.time()
+            with LOCK:
+                SERIES["cpu"].append((ts, round(cpu, 1)))
+                SERIES["ram"].append((ts, round(ram, 1)))
+                SERIES["net"].append((ts, int(rate)))
+                SERIES["disk"].append((ts, round(100 * du.used / du.total, 1)))
+                SERIES["load"].append((ts, round(load, 2)))
+        except Exception as e:
+            log("hub", "warn", "sampler: %s" % e)
+        time.sleep(5)
+
+def scheduler():
+    while True:
+        time.sleep(10)
+        now = time.time()
+        with LOCK:
+            agents = list(AGENTS.values())
+        for a in agents:
+            if a["interval"] > 0 and a["status"] == "idle":
+                if not a["last_ts"] or now - a["last_ts"] >= a["interval"]:
+                    log("hub", "info", "scheduler: lance %s (interval=%ss)" % (a["slug"], a["interval"]))
+                    run_agent(a["id"])
+
+def seed():
+    if not AGENTS:
+        agent_create({"name": "Sentinelle CPU", "goal": "surveiller le cpu et la charge systeme", "interval": 60})
+        agent_create({"name": "Gardien Disque", "goal": "surveiller l espace disque et les gros fichiers", "interval": 300})
+    log("hub", "ok", "NERCEL %s HUB demarre - port %d - theme grafana v10 restaure" % (VERSION, PORT))
+
+PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NERCEL HUB - ForgeHub v14</title>
+<style>
+:root{--bg:#111217;--panel:#181b1f;--panel2:#1f2226;--bd:#2c3235;--tx:#ccccdc;--dim:#8e8ea0;
+--or:#ff8f3a;--gr:#73bf69;--rd:#f2495c;--bl:#5794f2;--yl:#f2cc0c;--mono:'JetBrains Mono','Fira Code',monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,'Segoe UI',Roboto,sans-serif}
+#topbar{display:flex;align-items:center;gap:18px;background:#0b0c0e;border-bottom:1px solid var(--bd);padding:0 16px;height:52px;position:sticky;top:0;z-index:9}
+.brand{font-weight:800;letter-spacing:1px;color:#fff}
+.brand .hx{color:var(--or)}
+.brand .v{color:var(--or);font-size:11px;border:1px solid var(--or);padding:1px 6px;border-radius:3px;margin-left:6px}
+nav{display:flex;gap:2px;flex:1}
+.tab{background:none;border:none;color:var(--dim);padding:16px 14px;font-size:13px;cursor:pointer;border-bottom:2px solid transparent}
+.tab.active{color:#fff;border-bottom-color:var(--or)}
+.tab:hover{color:var(--tx)}
+.right{display:flex;gap:10px;align-items:center}
+.clock{color:var(--dim);font-family:var(--mono);font-size:12px}
+.badge{font-size:11px;border:1px solid var(--bd);border-radius:3px;padding:2px 8px;color:var(--dim)}
+main{padding:16px;max-width:1500px;margin:0 auto}
+.hidden{display:none!important}
+.row{display:grid;gap:12px;margin-bottom:12px}
+.row.stats{grid-template-columns:repeat(4,1fr)}
+.row.two{grid-template-columns:1fr 1fr}
+.panel{background:var(--panel);border:1px solid var(--bd);border-radius:4px;padding:12px}
+.ptitle{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:8px;display:flex;justify-content:space-between}
+.live{color:var(--gr);font-size:10px}
+.big{font-size:32px;font-weight:700;font-family:var(--mono);color:var(--or)}
+.stat canvas{width:100%;height:34px;margin-top:6px}
+canvas.chart{width:100%;height:120px}
+.term{background:#0a0a0c;border:1px solid var(--bd);border-radius:4px;color:#c8e1c8;font-family:var(--mono);font-size:12px;padding:10px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.term.big{height:calc(100vh - 210px)}
+.logmini .term{height:260px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.acard{background:var(--panel);border:1px solid var(--bd);border-radius:4px;padding:14px}
+.acard h3{font-size:15px;color:#fff}
+.acard .goal{color:var(--dim);font-size:12px;margin:6px 0}
+.tagrow .tag{display:inline-block;background:#20262b;color:var(--bl);font-size:10px;border-radius:3px;padding:2px 6px;margin:2px 4px 2px 0}
+.status{font-size:11px;font-weight:700}
+.status.ok{color:var(--gr)}.status.error{color:var(--rd)}.status.running{color:var(--yl)}.status.idle{color:var(--dim)}
+.cmd{font-family:var(--mono);font-size:10px;color:#6f7680;background:#0b0c0e;padding:6px;border-radius:3px;margin:8px 0;word-break:break-all;white-space:pre-wrap}
+.arow{display:flex;gap:6px}
+.last{font-size:11px;color:var(--dim);margin-top:8px;font-family:var(--mono)}
+.btn{background:var(--panel2);border:1px solid var(--bd);color:var(--tx);padding:7px 14px;border-radius:3px;cursor:pointer;font-size:13px}
+.btn.accent{background:var(--or);border-color:var(--or);color:#111;font-weight:700}
+.btn.sm{padding:4px 10px;font-size:12px}
+.btn.danger{border-color:var(--rd);color:var(--rd)}
+.btn:hover{filter:brightness(1.15)}
+input,select{background:#0b0c0e;border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:3px;font-size:13px;width:100%}
+.bar{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.bar h2{font-size:16px;color:#fff;flex:0 0 auto}
+.bar input{max-width:320px}
+.chk{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--dim)}
+.chk input{width:auto}
+.chatwrap{display:flex;flex-direction:column;height:calc(100vh - 120px)}
+.chead{display:flex;justify-content:space-between;padding-bottom:8px;border-bottom:1px solid var(--bd);font-weight:700}
+.cbox{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px}
+.msg{max-width:70%;padding:9px 12px;border-radius:8px;font-size:13px;white-space:pre-wrap}
+.msg.user{align-self:flex-end;background:#274a6b;color:#e8f1fb}
+.msg.agent{align-self:flex-start;background:var(--panel2);border:1px solid var(--bd)}
+.msg .who{font-size:10px;color:var(--or);margin-bottom:3px;font-weight:700}
+.crow{display:flex;gap:8px;padding-top:8px}
+.crow select{max-width:200px}
+.chips{display:flex;gap:6px;padding:6px 0;flex-wrap:wrap}
+.chips button{font-size:11px;background:#0b0c0e;border:1px solid var(--bd);color:var(--dim);padding:4px 10px;border-radius:12px;cursor:pointer}
+.chips button:hover{color:var(--or);border-color:var(--or)}
+.lv-info{color:var(--bl)}.lv-out{color:#c8e1c8}.lv-err{color:var(--rd)}.lv-ok{color:var(--gr)}.lv-warn{color:var(--yl)}.lv-sys{color:#b57ee0}.lv-chat{color:var(--or)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:20}
+.mbox{background:var(--panel);border:1px solid var(--bd);border-radius:6px;padding:20px;width:460px;display:flex;flex-direction:column;gap:8px}
+.mbox h3{color:#fff}
+.mbox label{font-size:11px;color:var(--dim)}
+.mrow{display:flex;gap:8px}
+.mrow input{width:110px}
+.hint{font-size:12px;color:var(--dim)}
+.toast{position:fixed;bottom:20px;right:20px;background:var(--panel2);border:1px solid var(--or);color:var(--tx);padding:10px 16px;border-radius:4px;z-index:30;font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono)}
+th,td{text-align:left;padding:4px 8px;border-bottom:1px solid #22262b;color:var(--dim)}
+td.ex{color:var(--tx)}
+@media(max-width:900px){.row,.row.stats,.row.two{grid-template-columns:1fr}}
+</style></head>
+<body>
+<header id="topbar">
+  <div class="brand"><span class="hx">&#x2B22;</span> NERCEL <span class="v">HUB v14</span></div>
+  <nav>
+    <button class="tab active" data-tab="dash">Tableau de bord</button>
+    <button class="tab" data-tab="agents">Agents</button>
+    <button class="tab" data-tab="chat">Chat</button>
+    <button class="tab" data-tab="logs">Logs</button>
+    <button class="tab" data-tab="scaff">Scaffolds</button>
+    <button class="tab" data-tab="cata">Catalogue OSS</button>
+  </nav>
+  <div class="right"><span id="ollamaBadge" class="badge">Ollama: ?</span><span id="clock" class="clock"></span></div>
+</header>
+<main>
+<section id="tab-dash" class="view">
+  <div class="row stats">
+    <div class="panel stat"><div class="ptitle">CPU</div><div class="big" id="st-cpu">-</div><canvas id="sp-cpu"></canvas></div>
+    <div class="panel stat"><div class="ptitle">RAM</div><div class="big" id="st-ram">-</div><canvas id="sp-ram"></canvas></div>
+    <div class="panel stat"><div class="ptitle">Disque</div><div class="big" id="st-disk">-</div><canvas id="sp-disk"></canvas></div>
+    <div class="panel stat"><div class="ptitle">Charge</div><div class="big" id="st-load">-</div><canvas id="sp-load"></canvas></div>
+  </div>
+  <div class="row two">
+    <div class="panel"><div class="ptitle">CPU % (5s par point)</div><canvas id="ch-cpu" class="chart"></canvas></div>
+    <div class="panel"><div class="ptitle">RAM %</div><canvas id="ch-ram" class="chart"></canvas></div>
+  </div>
+  <div class="row two">
+    <div class="panel"><div class="ptitle">Reseau (B/s)</div><canvas id="ch-net" class="chart"></canvas></div>
+    <div class="panel"><div class="ptitle">Charge (load 1m)</div><canvas id="ch-load" class="chart"></canvas></div>
+  </div>
+  <div class="row two">
+    <div class="panel"><div class="ptitle">Executions recentes</div>
+      <table><thead><tr><th>Heure</th><th>Agent</th><th>Statut</th><th>Exit</th></tr></thead>
+      <tbody id="runTableBody"></tbody></table></div>
+    <div class="panel logmini"><div class="ptitle">Flux live <span class="live">&#9679; live</span></div>
+      <pre id="miniLog" class="term"></pre></div>
+  </div>
+</section>
+<section id="tab-agents" class="view hidden">
+  <div class="bar"><h2>Agents</h2>
+    <button class="btn accent" onclick="openModal()">+ Nouvel agent</button></div>
+  <div id="agentGrid" class="grid"></div>
+</section>
+<section id="tab-chat" class="view hidden">
+  <div class="chatwrap panel">
+    <div class="chead"><span>Zone de chat - le hub repond ET agit</span>
+      <span id="chatEngine" class="badge">moteur: ?</span></div>
+    <div id="chatBox" class="cbox"></div>
+    <div class="chips">
+      <button onclick="chip('etat')">etat</button>
+      <button onclick="chip('liste')">liste des agents</button>
+      <button onclick="chip('cree un agent qui surveille le reseau')">cree agent reseau</button>
+      <button onclick="chip('logs')">logs</button>
+    </div>
+    <div class="crow">
+      <select id="chatAgent"><option value="">hub (general)</option></select>
+      <input id="chatInput" placeholder="Ecris au hub... ex: cree un agent qui surveille le CPU" onkeydown="if(event.key==='Enter')sendChat()">
+      <button class="btn accent" onclick="sendChat()">Envoyer</button>
+    </div>
+  </div>
+</section>
+<section id="tab-logs" class="view hidden">
+  <div class="bar"><h2>Logs live</h2>
+    <select id="logFilter" style="max-width:220px" onchange="LOG_AFTER=0;loadLogs()"><option value="">tous les agents</option></select>
+    <label class="chk"><input type="checkbox" id="logPause"> pause</label>
+    <span id="logCount" class="badge">0 lignes</span></div>
+  <pre id="logTerm" class="term big"></pre>
+</section>
+<section id="tab-scaff" class="view hidden">
+  <div class="bar"><h2>Scaffolds - vrais fichiers sur disque</h2></div>
+  <div class="row two">
+    <div class="panel">
+      <div class="ptitle">Creer un projet</div>
+      <input id="scafName" placeholder="nom du projet (ex: mon-forge)" style="margin-bottom:8px">
+      <select id="scafBp" style="margin-bottom:8px"></select>
+      <div id="bpDesc" class="hint" style="margin-bottom:8px"></div>
+      <button class="btn accent" onclick="createScaffold()">Generer les fichiers</button>
+    </div>
+    <div class="panel"><div class="ptitle">Projets crees (disque reel)</div><div id="scafList"></div></div>
+  </div>
+</section>
+<section id="tab-cata" class="view hidden">
+  <div class="bar"><h2>Catalogue - 12 agents open source</h2>
+    <input id="recGoal" placeholder="ton objectif... ex: agent qui code en python">
+    <button class="btn accent" onclick="doRec()">Recommander</button></div>
+  <div id="recBox" class="grid" style="margin-bottom:12px"></div>
+  <div id="cataGrid" class="grid"></div>
+</section>
+</main>
+<div id="modal" class="modal hidden"><div class="mbox">
+  <h3>Creer un agent</h3>
+  <label>Nom</label><input id="mName" placeholder="ex: Sentinelle RAM">
+  <label>Objectif (le moteur en deduit la commande)</label><input id="mGoal" placeholder="ex: surveiller le disque et les gros fichiers">
+  <label>Prompt optionnel (mots-cles: cpu, ram, disque, reseau, git, backup...)</label><input id="mPrompt" placeholder="vide = deduit de l objectif">
+  <div class="mrow"><div style="flex:1"><label>Interval auto (s, 0 = manuel)</label><input id="mInt" type="number" value="0" min="0"></div></div>
+  <label class="chk"><input id="mOllama" type="checkbox"> Utiliser Ollama (local) pour generer la commande</label>
+  <div id="mRec" class="hint"></div>
+  <div class="mrow"><button class="btn accent" onclick="createAgent()">Creer</button>
+  <button class="btn" onclick="closeModal()">Annuler</button></div>
+</div></div>
+<div id="toast" class="toast hidden"></div>
+<script>
+const $ = id => document.getElementById(id);
+const h = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let TAB = 'dash', LOG_AFTER = 0, LOG_LINES = 0, chatBusy = false;
+let SERIES = null;
+
+function api(path, body){
+  const opt = body ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)} : {};
+  return fetch(path, opt).then(async r => {
+    const txt = await r.text();
+    let j; try { j = JSON.parse(txt); } catch(e){ throw new Error('HTTP '+r.status+' reponse non-JSON: '+txt.slice(0,120)); }
+    if (!r.ok) throw new Error(j.error || ('HTTP '+r.status));
+    return j;
+  });
+}
+function toast(msg, err){
+  const t = $('toast'); t.textContent = msg;
+  t.style.borderColor = err ? '#f2495c' : '#ff8f3a';
+  t.classList.remove('hidden');
+  clearTimeout(t._h); t._h = setTimeout(()=>t.classList.add('hidden'), 3500);
+}
+function switchTab(name){
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelector('.tab[data-tab="'+name+'"]').classList.add('active');
+  TAB = name;
+  document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
+  $('tab-'+name).classList.remove('hidden');
+  if (name === 'scaff') loadScaff();
+  if (name === 'cata') loadCata();
+}
+document.querySelectorAll('.tab').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
+setInterval(()=>{ $('clock').textContent = new Date().toLocaleTimeString('fr-FR'); }, 1000);
+
+function draw(el, data, color, cap){
+  if (!el) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = el.clientWidth, hg = el.clientHeight;
+  if (!w) return;
+  el.width = w*dpr; el.height = hg*dpr;
+  const c = el.getContext('2d'); c.scale(dpr, dpr);
+  c.clearRect(0,0,w,hg);
+  if (!data || !data.length) return;
+  const vals = data.map(p=>p[1]);
+  let max = Math.max(...vals, 1);
+  if (cap) max = Math.max(cap, max);
+  c.strokeStyle = '#2c3235'; c.beginPath(); c.moveTo(0, hg-0.5); c.lineTo(w, hg-0.5); c.stroke();
+  c.strokeStyle = color; c.lineWidth = 1.6; c.beginPath();
+  vals.forEach((v,i)=>{ const x = i/(vals.length-1||1)*w; const y = hg-4-(Math.min(v,max)/max)*(hg-8); i?c.lineTo(x,y):c.moveTo(x,y); });
+  c.stroke();
+}
+function drawCharts(){
+  if (!SERIES) return;
+  draw($('ch-cpu'), SERIES.cpu, '#ff8f3a', 100);
+  draw($('ch-ram'), SERIES.ram, '#5794f2', 100);
+  draw($('ch-net'), SERIES.net, '#73bf69');
+  draw($('ch-load'), SERIES.load, '#f2cc0c');
+  draw($('sp-cpu'), SERIES.cpu.slice(-40), '#ff8f3a', 100);
+  draw($('sp-ram'), SERIES.ram.slice(-40), '#5794f2', 100);
+  draw($('sp-disk'), SERIES.disk.slice(-40), '#f2495c', 100);
+  draw($('sp-load'), SERIES.load.slice(-40), '#f2cc0c');
+}
+function renderRuns(runs){
+  $('runTableBody').innerHTML = runs.slice(0, 12).map(r => {
+    const cls = r.status==='ok'?'ok':(r.status==='error'?'error':(r.status==='running'?'running':'idle'));
+    const d = new Date(r.ts*1000).toLocaleTimeString('fr-FR');
+    return '<tr><td>'+d+'</td><td class="ex">'+h(r.agent)+'</td><td><span class="status '+cls+'">'+r.status+'</span></td><td>'+(r.exit==null?'-':'exit '+r.exit)+'</td></tr>';
+  }).join('') || '<tr><td colspan="4">aucune execution - lance un agent</td></tr>';
+}
+function renderAgents(ags){
+  $('agentGrid').innerHTML = ags.map(a => `
+    <div class="acard">
+      <div style="display:flex;justify-content:space-between">
+        <h3>${h(a.name)}</h3>
+        <span class="status ${a.status==='running'?'running':(a.last_status==='ok'?'ok':(a.last_status==='error'?'error':'idle'))}">${a.status==='running'?'running':a.last_status}</span>
+      </div>
+      <div class="goal">${h(a.goal)}</div>
+      <div class="tagrow"><span class="tag">src: ${h(a.source)}</span><span class="tag">runs: ${a.runs}</span><span class="tag">auto: ${a.interval}s</span></div>
+      <div class="cmd">${h(a.cmd)}</div>
+      <div class="arow">
+        <button class="btn sm accent" onclick="runAgent('${a.id}')">Lancer</button>
+        <button class="btn sm" onclick="seeLogs('${h(a.slug)}')">Logs</button>
+        <button class="btn sm danger" onclick="delAgent('${a.id}')">Supprimer</button>
+      </div>
+      <div class="last">${a.last_ts ? 'dernier: '+new Date(a.last_ts*1000).toLocaleTimeString('fr-FR')+' - exit '+(a.last_exit==null?'?':a.last_exit) : 'jamais lance'}</div>
+    </div>`).join('') || '<div class="hint">Aucun agent - clique + Nouvel agent ou passe par le Chat.</div>';
+}
+function syncAgentSelect(ags){
+  const sel = $('chatAgent'); const cur = sel.value;
+  sel.innerHTML = '<option value="">hub (general)</option>' + ags.map(a=>`<option value="${a.id}">${h(a.name)}</option>`).join('');
+  sel.value = cur;
+}
+function syncLogFilter(ags){
+  const sel = $('logFilter'); const cur = sel.value;
+  sel.innerHTML = '<option value="">tous les agents</option>' + ags.map(a=>`<option value="${h(a.slug)}">${h(a.slug)}</option>`).join('');
+  sel.value = cur;
+}
+async function loadState(){
+  try {
+    const j = await api('/api/state');
+    SERIES = j.series;
+    $('st-cpu').textContent = j.metrics.cpu.toFixed(1)+'%';
+    $('st-ram').textContent = j.metrics.ram.toFixed(1)+'%';
+    $('st-disk').textContent = j.metrics.disk.toFixed(1)+'%';
+    $('st-load').textContent = j.metrics.load.toFixed(2);
+    $('ollamaBadge').textContent = j.ollama ? 'Ollama: actif' : 'Ollama: absent';
+    drawCharts(); renderRuns(j.runs); renderAgents(j.agents);
+    syncAgentSelect(j.agents); syncLogFilter(j.agents);
+  } catch(e){ $('ollamaBadge').textContent = 'srv: ' + e.message; }
+}
+setInterval(loadState, 3000); loadState();
+
+async function loadLogs(){
+  if ($('logPause').checked) return;
+  try {
+    const f = $('logFilter').value;
+    const j = await api('/api/logs?after='+LOG_AFTER+(f?'&agent='+encodeURIComponent(f):''));
+    if (j.lines.length){
+      for (const l of j.lines){
+        const t = new Date(l.ts*1000).toLocaleTimeString('fr-FR');
+        const line = t+'  ['+l.level.toUpperCase()+'] '+l.agent.padEnd(10)+' '+l.text+'\\n';
+        appendTerm($('logTerm'), line, 'lv-'+l.level);
+        appendTerm($('miniLog'), line, 'lv-'+l.level);
+      }
+      LOG_AFTER = j.seq; LOG_LINES += j.lines.length;
+      $('logCount').textContent = LOG_LINES+' lignes';
+      $('logTerm').scrollTop = $('logTerm').scrollHeight;
+      $('miniLog').scrollTop = $('miniLog').scrollHeight;
+    }
+  } catch(e){}
+}
+function appendTerm(term, text, cls){
+  const span = document.createElement('span'); span.className = cls; span.textContent = text;
+  term.appendChild(span);
+  while (term.childNodes.length > 800) term.removeChild(term.firstChild);
+}
+setInterval(loadLogs, 1500); loadLogs();
+
+function addMsg(m){
+  const div = document.createElement('div'); div.className = 'msg ' + (m.role==='user'?'user':'agent');
+  const w = document.createElement('div'); w.className='who';
+  w.textContent = m.role==='user' ? 'toi / '+(m.agent||'hub') : (m.agent||'hub')+' / agent';
+  const b = document.createElement('div'); b.textContent = m.text;
+  div.appendChild(w); div.appendChild(b);
+  $('chatBox').appendChild(div);
+}
+async function loadChat(){
+  try {
+    const j = await api('/api/chat');
+    const box = $('chatBox');
+    if (j.chat.length !== box.childElementCount){
+      box.innerHTML = '';
+      for (const m of j.chat) addMsg(m);
+      box.scrollTop = box.scrollHeight;
+    }
+    $('chatEngine').textContent = j.ollama ? ('moteur: ollama ('+j.model+')') : 'moteur: forge-engine';
+  } catch(e){}
+}
+async function sendChat(){
+  if (chatBusy) return;
+  const inp = $('chatInput'); const msg = inp.value.trim(); if (!msg) return;
+  inp.value = ''; chatBusy = true;
+  try { await api('/api/chat', {message: msg, agent_id: $('chatAgent').value}); await loadChat(); }
+  catch(e){ toast('Chat: '+e.message, true); }
+  chatBusy = false; $('chatInput').focus();
+}
+function chip(t){ $('chatInput').value = t; sendChat(); }
+setInterval(loadChat, 2000); loadChat();
+
+async function runAgent(id){
+  try { await api('/api/agents/'+id+'/run', {}); toast('Agent lance - onglet Logs'); switchTab('logs'); }
+  catch(e){ toast('Echec: '+e.message, true); }
+}
+function seeLogs(slug){ $('logFilter').value = slug; LOG_AFTER = 0; switchTab('logs'); }
+async function delAgent(id){
+  if (!confirm('Supprimer cet agent ?')) return;
+  try { await api('/api/agents/'+id+'/delete', {}); toast('Agent supprime'); loadState(); }
+  catch(e){ toast('Echec: '+e.message, true); }
+}
+function openModal(){ $('modal').classList.remove('hidden'); }
+function closeModal(){ $('modal').classList.add('hidden'); }
+async function createAgent(){
+  const name = $('mName').value.trim(), goal = $('mGoal').value.trim();
+  if (!goal){ toast('Objectif requis', true); return; }
+  try {
+    const j = await api('/api/agents/create', {name, goal, prompt: $('mPrompt').value.trim(),
+      interval: parseInt($('mInt').value||'0'), use_ollama: $('mOllama').checked});
+    toast('Agent cree: '+j.agent.name);
+    closeModal(); $('mName').value=''; $('mGoal').value=''; $('mPrompt').value='';
+    loadState(); switchTab('agents');
+  } catch(e){ toast('Echec: '+e.message, true); }
+}
+ $('mGoal').addEventListener('input', async e => {
+  const g = e.target.value.trim(); if (g.length < 4){ $('mRec').textContent=''; return; }
+  try { const j = await api('/api/agents/recommend', {goal:g});
+    $('mRec').textContent = j.recommend.length ? 'Recommande: ' + j.recommend.map(r=>r.name).join(' / ') : '';
+  } catch(err){}
+});
+
+let BPS = {};
+async function loadScaff(){
+  try {
+    const j = await api('/api/scaffolds');
+    BPS = j.blueprints;
+    const sel = $('scafBp');
+    if (!sel.options.length && Object.keys(BPS).length){
+      sel.innerHTML = Object.entries(BPS).map(([k,v])=>`<option value="${k}">${k} - ${h(v.label)}</option>`).join('');
+      sel.onchange = () => { $('bpDesc').textContent = BPS[sel.value].desc + '  ->  ' + BPS[sel.value].run; };
+      sel.onchange();
+    }
+    $('scafList').innerHTML = j.scaffolds.map(s=>`
+      <div class="acard"><h3>${h(s.slug)}</h3><div class="goal">${h(s.path)}</div>
+      <div class="cmd">${s.files.map(h).join('\\n')}</div></div>`).join('')
+      || '<div class="hint">Aucun projet encore - cree le premier.</div>';
+  } catch(e){}
+}
+async function createScaffold(){
+  try {
+    const j = await api('/api/scaffolds/create', {name: $('scafName').value.trim(), blueprint: $('scafBp').value});
+    toast('Projet cree: '+j.scaffold.slug+' ('+j.scaffold.files.length+' fichiers)');
+    loadScaff();
+  } catch(e){ toast('Echec: '+e.message, true); }
+}
+
+async function loadCata(){
+  try {
+    const j = await api('/api/catalog');
+    $('cataGrid').innerHTML = j.catalog.map(c=>`
+      <div class="acard"><h3><a href="${c.url}" target="_blank" style="color:var(--bl)">${h(c.name)}</a></h3>
+      <div class="goal">${h(c.desc)}</div>
+      <div class="tagrow">${c.tags.map(t=>`<span class="tag">${h(t)}</span>`).join('')}</div>
+      <div class="cmd">${h(c.install)}</div></div>`).join('');
+  } catch(e){}
+}
+async function doRec(){
+  const g = $('recGoal').value.trim(); if (!g) return;
+  try {
+    const j = await api('/api/agents/recommend', {goal:g});
+    $('recBox').innerHTML = j.recommend.length ? j.recommend.map(r=>`
+      <div class="acard" style="border-color:var(--or)"><h3 style="color:var(--or)">${h(r.name)} - score ${r.score}</h3>
+      <div class="goal">${h(r.desc)}</div><div class="hint">match: ${h(r.matched.join(', '))}</div>
+      <div class="cmd">${h(r.install)}</div></div>`).join('')
+      : '<div class="hint">Aucune reco - precise des mots-cles (code, python, disk, chat, workflow...).</div>';
+  } catch(e){ toast('Echec: '+e.message, true); }
+}
+loadScaff(); loadCata();
+</script>
+</body></html>"""
+
+class H(BaseHTTPRequestHandler):
+    server_version = "Nercel14"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, obj, code=200):
+        try:
+            body = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _page(self):
+        body = PAGE.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b"{}"
+        try:
+            return json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        p = u.path
+        try:
+            if p == "/":
+                return self._page()
+            if p == "/api/health":
+                with LOCK:
+                    return self._json({"ok": True, "version": VERSION,
+                                       "uptime_s": int(time.time() - START_TS),
+                                       "agents": len(AGENTS), "runs": len(RUNS),
+                                       "logs": LOG_SEQ, "chat": len(CHAT)})
+            if p == "/api/state":
+                with LOCK:
+                    series = {k: [list(x) for x in v] for k, v in SERIES.items()}
+                    ags = [dict(a) for a in AGENTS.values()]
+                    rns = list(RUNS)[:60]
+                up, model = ollama_state()
+                return self._json({"metrics": metrics_snapshot(), "series": series,
+                                   "agents": ags, "runs": rns, "ollama": up,
+                                   "model": model, "uptime_s": int(time.time() - START_TS),
+                                   "version": VERSION})
+            if p == "/api/logs":
+                try:
+                    after = int((q.get("after") or ["0"])[0] or 0)
+                except Exception:
+                    after = 0
+                agent = (q.get("agent") or [""])[0]
+                with LOCK:
+                    lines = [l for l in LOG_FEED
+                             if l["seq"] > after and (not agent or l["agent"] == agent)]
+                return self._json({"seq": LOG_SEQ, "lines": lines[-600:]})
+            if p == "/api/catalog":
+                return self._json({"catalog": OSS_CATALOG})
+            if p == "/api/scaffolds":
+                out = []
+                if os.path.isdir(SCAFFOLD_ROOT):
+                    for d in sorted(os.listdir(SCAFFOLD_ROOT)):
+                        fp = os.path.join(SCAFFOLD_ROOT, d)
+                        if os.path.isdir(fp):
+                            out.append({"slug": d, "path": fp,
+                                        "files": sorted(f for f in os.listdir(fp)
+                                                        if os.path.isfile(os.path.join(fp, f)))})
+                bps = {k: {"label": v["label"], "desc": v["desc"], "run": v["cmd"]}
+                       for k, v in BLUEPRINTS.items()}
+                return self._json({"scaffolds": out, "blueprints": bps})
+            if p == "/api/chat":
+                with LOCK:
+                    ch = list(CHAT)[-150:]
+                up, model = ollama_state()
+                return self._json({"chat": ch, "ollama": up, "model": model})
+            return self._json({"error": "route inconnue: %s" % p}, 404)
+        except Exception as e:
+            return self._json({"error": "exception serveur: %s" % e}, 500)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        parts = [s for s in u.path.split("/") if s]
+        p = self._body()
+        try:
+            if u.path == "/api/agents/create":
+                a, err = agent_create(p)
+                return self._json({"error": err} if err else {"agent": a}, 400 if err else 200)
+            if u.path == "/api/agents/recommend":
+                return self._json({"goal": p.get("goal"),
+                                   "recommend": recommend(p.get("goal"))})
+            if u.path == "/api/chat":
+                r, err = chat_post(p)
+                return self._json({"error": err} if err else r, 400 if err else 200)
+            if u.path == "/api/ollama/check":
+                up, model = ollama_state(force=True)
+                return self._json({"ollama": up, "model": model})
+            if u.path == "/api/scaffolds/create":
+                r, err = scaffold_create(p)
+                return self._json({"error": err} if err else {"scaffold": r}, 400 if err else 200)
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "agents":
+                aid = parts[2]
+                if parts[3] == "run":
+                    r, err = run_agent(aid)
+                    return self._json({"error": err} if err else {"run": r}, 400 if err else 200)
+                if parts[3] == "delete":
+                    with LOCK:
+                        a = AGENTS.pop(aid, None)
+                    if not a:
+                        return self._json({"error": "agent inconnu"}, 404)
+                    log("hub", "warn", "agent supprime: " + a["slug"])
+                    return self._json({"ok": True})
+                if parts[3] == "update":
+                    with LOCK:
+                        a = AGENTS.get(aid)
+                        if not a:
+                            return self._json({"error": "agent inconnu"}, 404)
+                        if "interval" in p:
+                            a["interval"] = max(0, int(p["interval"] or 0))
+                        if p.get("goal"):
+                            a["goal"] = p["goal"]
+                    return self._json({"agent": a})
+            return self._json({"error": "route POST inconnue: %s" % u.path}, 404)
+        except Exception as e:
+            return self._json({"error": "exception serveur: %s" % e}, 500)
+
+def main():
+    os.makedirs(SCAFFOLD_ROOT, exist_ok=True)
+    seed()
+    threading.Thread(target=sampler, daemon=True).start()
+    threading.Thread(target=scheduler, daemon=True).start()
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+    srv.daemon_threads = True
+    print("NERCEL 14 HUB -> http://localhost:%d  (Ctrl+C pour arreter)" % PORT)
+    srv.serve_forever()
+
+if __name__ == "__main__":
+    main()
+PYEOF
+wc -l nercel14.py && python3 -m py_compile nercel14.py && echo "COMPILE OK"
